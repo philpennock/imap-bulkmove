@@ -23,11 +23,14 @@ const (
 )
 
 var flags struct {
+	authzId        string
 	serverHostname string
 	serverRealm    string
 }
 
 func init() {
+	flag.StringVar(&flags.authzId, "authz-id",
+		"", "SASL authorization identity to request")
 	flag.StringVar(&flags.serverHostname, "server",
 		os.Getenv("IMAP_SERVER"), "IMAP server hostname")
 	flag.StringVar(&flags.serverRealm, "krb-realm",
@@ -55,6 +58,7 @@ type Releaseable interface {
 
 type gssapiAuth struct {
 	realm            string
+	authzId          string
 	hostname         string
 	lib              *gssapi.Lib
 	ctx              *gssapi.CtxId
@@ -68,13 +72,14 @@ type gssapiAuth struct {
 
 // GSSAPIAuth is like the SASL constructions which the IMAP package uses, but
 // we also return an error.
-func GSSAPIAuth(serverName string) (imap.SASL, error) {
+func GSSAPIAuth(serverName, authzId string) (imap.SASL, error) {
 	gsslib, err := gssapiLoad()
 	if err != nil {
 		return nil, err
 	}
 	sasl := &gssapiAuth{
 		realm:        strings.ToUpper(flags.serverRealm),
+		authzId:      authzId,
 		hostname:     serverName,
 		lib:          gsslib,
 		releaseStack: make([]Releaseable, 0, 10),
@@ -271,10 +276,15 @@ func (a *gssapiAuth) Next(challenge []byte) (response []byte, err error) {
 			return nil, fmt.Errorf("server demands GSSAPI security layers, which we don't implement: %d", bitmask)
 		}
 
-		response := make([]byte, 4)
+		// the authorization identifier is appended to a leading 4 octets, and
+		// is UTF-8 encoded without trailing NUL.  Since our in-memory string
+		// is already UTF-8, we're golden and can use len()
+		response := make([]byte, 4+len(a.authzId))
 		response[0] = 0x01 // select no security layer
 		// response[1:4] left at 0, because no security layer
-		// no authorization identifier passed along, or we'd append it here
+		if len(a.authzId) > 0 {
+			copy(response[4:], a.authzId)
+		}
 		responseBuffer, err := a.lib.MakeBufferBytes(response)
 		if err != nil {
 			return nil, err
@@ -416,7 +426,7 @@ func setupIMAP(defersChan chan<- func(), errorsChan chan<- error) {
 		errorsChan <- errors.New("Capability response missing AUTH=GSSAPI")
 		return
 	}
-	sasl, err := GSSAPIAuth(flags.serverHostname)
+	sasl, err := GSSAPIAuth(flags.serverHostname, flags.authzId)
 	defersChan <- func() { sasl.(*gssapiAuth).Cleanup() }
 	if err != nil {
 		errorsChan <- err
