@@ -2,10 +2,10 @@ package main
 
 import (
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -15,6 +15,8 @@ import (
 	"code.google.com/p/go-imap/go1/imap"
 	"github.com/apcera/gssapi"
 )
+
+// FIXME: use typed errors
 
 const (
 	maxGSSAPIStepIterations = 5
@@ -47,14 +49,21 @@ func gssapiLoad() (*gssapi.Lib, error) {
 	return gssapiLoader.lib, gssapiLoader.err
 }
 
+type Releaseable interface {
+	Release() error
+}
+
 type gssapiAuth struct {
 	realm            string
 	hostname         string
 	lib              *gssapi.Lib
 	ctx              *gssapi.CtxId
 	serverName       *gssapi.Name
-	releaseNameStack []*gssapi.Name
-	_                struct{}
+	releaseStack     []Releaseable
+	clientMechanisms *gssapi.OIDSet
+	requestMech      *gssapi.OID
+	maxMessageLen    uint
+	stepCount        int
 }
 
 // GSSAPIAuth is like the SASL constructions which the IMAP package uses, but
@@ -64,11 +73,11 @@ func GSSAPIAuth(serverName string) (imap.SASL, error) {
 	if err != nil {
 		return nil, err
 	}
-	sasl := gssapiAuth{
-		realm:            strings.ToUpper(flags.serverRealm),
-		hostname:         serverName,
-		lib:              gsslib,
-		releaseNameStack: make([]*gssapi.Name, 0, 10),
+	sasl := &gssapiAuth{
+		realm:        strings.ToUpper(flags.serverRealm),
+		hostname:     serverName,
+		lib:          gsslib,
+		releaseStack: make([]Releaseable, 0, 10),
 	}
 
 	var serverId string
@@ -87,30 +96,71 @@ func GSSAPIAuth(serverName string) (imap.SASL, error) {
 		return nil, err
 	}
 	sasl.serverName = name
-	sasl.releaseNameStack = append(sasl.releaseNameStack, name)
+	sasl.releaseStack = append(sasl.releaseStack, name)
+
+	err = sasl.CheckClientCredentials()
+	if err != nil {
+		return nil, err
+	}
 
 	return sasl, nil
 }
 
-func (a gssapiAuth) Cleanup() {
+func (a *gssapiAuth) Cleanup() {
 	if a.ctx != nil {
 		a.ctx.DeleteSecContext()
 		a.ctx = nil
 	}
-	if a.releaseNameStack != nil {
-		for i := len(a.releaseNameStack) - 1; i >= 0; i-- {
-			a.releaseNameStack[i].Release()
+	if a.releaseStack != nil && len(a.releaseStack) > 0 {
+		for i := len(a.releaseStack) - 1; i >= 0; i-- {
+			a.releaseStack[i].Release()
 		}
-		a.releaseNameStack = nil
+		a.releaseStack = nil
 	}
 }
 
-func (a gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err error) {
+func (a *gssapiAuth) CheckClientCredentials() error {
+	name, lifetime, credUsage, mechanisms, err := a.lib.InquireCred(a.lib.GSS_C_NO_CREDENTIAL)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		name.Release()
+	}()
+
+	fmt.Printf("Have client credentials for: %q\n", name)
+	// should be checking lifetime against -1 or 2^32-1 (GSS_C_INDEFINITE) but the lifetime
+	// in this wrapper is multiplying by time.Second ... huh?
+	fmt.Printf("client credentials lifetime: %s\n", lifetime)
+	if credUsage != gssapi.GSS_C_BOTH && credUsage != gssapi.GSS_C_INITIATE {
+		return fmt.Errorf("GSSAPI credentials don't allow initiation: %d", credUsage)
+	}
+	fmt.Printf("mechanisms supported: %s\n", mechanisms.DebugString())
+
+	a.clientMechanisms = mechanisms
+	a.releaseStack = append(a.releaseStack, a.clientMechanisms)
+
+	return nil
+}
+
+func (a *gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err error) {
 	receiveToken := a.lib.GSS_C_NO_BUFFER
 	defer receiveToken.Release()
 	sendToken := a.lib.GSS_C_NO_BUFFER
 	defer sendToken.Release()
-	var retFlags uint32
+	var (
+		retFlags uint32
+		mechUsed *gssapi.OID
+	)
+
+	if a.clientMechanisms.Contains(a.lib.GSS_MECH_SPNEGO) {
+		a.requestMech = a.lib.GSS_MECH_SPNEGO
+	} else {
+		fmt.Fprintf(os.Stderr, "WARNING: client credentials do not support SPNEGO\n")
+		a.requestMech = a.lib.GSS_C_NO_OID
+	}
+
+	a.stepCount += 1
 
 	// comments here mostly come from Heimdal man-page (more so for input params)
 
@@ -127,7 +177,7 @@ func (a gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err error
 	//         negotiated with the acceptor or not.
 	// time.Duration: time_rec amount of time this context is valid for
 	// error: major/minor constructed error
-	a.ctx, _, sendToken, retFlags, _, err =
+	a.ctx, mechUsed, sendToken, retFlags, _, err =
 		a.lib.InitSecContext(
 			// initiator_cred_handle the credential to use when building the
 			// context, if GSS_C_NO_CREDENTIAL is passed, the default
@@ -144,10 +194,10 @@ func (a gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err error
 			// input_mech_type mechanism type to use, if GSS_C_NO_OID is used,
 			// Kerberos (GSS_KRB5_MECHANISM) will be tried. Other available
 			// mechanism are listed in the GSS-API mechanisms section.
-			a.lib.GSS_C_NO_OID,
+			a.requestMech,
 			// req_flags flags using when building the context, see Context
 			// creation flags
-			0,
+			gssapi.GSS_C_MUTUAL_FLAG,
 			// time_req time requested this context should be valid in seconds,
 			// common used value is GSS_C_INDEFINITE
 			0,
@@ -161,17 +211,151 @@ func (a gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err error
 	if err != nil {
 		return "", []byte{}, err
 	}
-	fmt.Printf("retFlags: %x\n", retFlags)
+	fmt.Fprintf(os.Stderr, "selected mechanism: %s\n", mechUsed.DebugString())
+	decodeGSSAPIContextFlags(os.Stdout, retFlags)
 
-	initialResponse := make([]byte, 0, sendToken.Length()*4/3)
-	base64.StdEncoding.Encode(initialResponse, sendToken.Bytes())
-	return "GSSAPI", initialResponse, nil
+	//initialResponse := make([]byte, base64.StdEncoding.EncodedLen(sendToken.Length()))
+	//base64.StdEncoding.Encode(initialResponse, sendToken.Bytes())
+	//fmt.Fprintf(os.Stderr, "AUTH PARAM: %q\n", string(initialResponse))
+	//return "GSSAPI", initialResponse, nil
+
+	// The IMAP library does the base64 encoding for us
+	return "GSSAPI", sendToken.Bytes(), nil
 }
 
-func (a gssapiAuth) Next(challenge []byte) (response []byte, err error) {
-	// XXX: this says that auth is done
-	panic("unimplemented")
+func (a *gssapiAuth) Next(challenge []byte) (response []byte, err error) {
+	a.stepCount += 1
+
+	receiveToken, err := a.lib.MakeBufferBytes(challenge)
+	if err != nil {
+		return nil, err
+	}
+	defer receiveToken.Release()
+
+	// FIXME XXX GROSS HACK
+	// We need to be checking GSS_S_COMPLETE from the previous pass, but the Go
+	// bindings don't expose a way to get that?  So rely upon knowledge of
+	// Kerberos flow to stop after the GSS bits are complete and extract the
+	// SASL data instead.
+	if a.stepCount > 2 {
+		// SASL data, not GSS input
+
+		// decoded (unwrapped) buffer, confState, QOPState, err
+		decodedBuffer, _, _, err := a.ctx.Unwrap(receiveToken)
+		if err != nil {
+			return nil, err
+		}
+		defer decodedBuffer.Release()
+		if decodedBuffer.Length() != 4 {
+			// RFC 4752 §3.1: "If the resulting cleartext is not 4 octets long, the client fails the negotiation."
+			return nil, fmt.Errorf("unwrapped SASL state length was %d, expected 4", decodedBuffer.Length())
+		}
+		decoded := decodedBuffer.Bytes()
+		bitmask := decoded[0]
+		a.maxMessageLen = ((uint(decoded[1])*256)+uint(decoded[2]))*256 + uint(decoded[3])
+
+		// RFC 4752 §3.3
+		fmt.Printf("offered security bitmask:")
+		if bitmask&0x01 != 0 {
+			fmt.Printf(" <none>")
+		}
+		if bitmask&0x02 != 0 {
+			fmt.Printf(" <integrity>")
+		}
+		if bitmask&0x04 != 0 {
+			fmt.Printf(" <confidentiality>")
+		}
+		fmt.Printf("\n")
+
+		if bitmask&0x01 == 0 {
+			return nil, fmt.Errorf("server demands GSSAPI security layers, which we don't implement: %d", bitmask)
+		}
+
+		response := make([]byte, 4)
+		response[0] = 0x01 // select no security layer
+		// response[1:4] left at 0, because no security layer
+		// no authorization identifier passed along, or we'd append it here
+		responseBuffer, err := a.lib.MakeBufferBytes(response)
+		if err != nil {
+			return nil, err
+		}
+		defer responseBuffer.Release()
+
+		// confState bool, outputMessageBuffer *Buffer, err error
+		_, encoded, err := a.ctx.Wrap(
+			false, // no confidentiality
+			0,     // no qop set (should derive from stats about TLS status)
+			responseBuffer)
+		if err != nil {
+			return nil, err
+		}
+		defer encoded.Release()
+		return encoded.Bytes(), nil
+	}
+
+	sendToken := a.lib.GSS_C_NO_BUFFER
+	defer sendToken.Release()
+	var retFlags uint32
+
+	a.ctx, _, sendToken, retFlags, _, err =
+		a.lib.InitSecContext(
+			a.lib.GSS_C_NO_CREDENTIAL,
+			a.ctx,
+			a.serverName,
+			a.requestMech,
+			gssapi.GSS_C_MUTUAL_FLAG,
+			0,
+			a.lib.GSS_C_NO_CHANNEL_BINDINGS,
+			receiveToken)
+	if err != nil {
+		return nil, err
+	}
+	decodeGSSAPIContextFlags(os.Stdout, retFlags)
+
+	if sendToken != nil && sendToken.Length() > 0 {
+		fmt.Fprintf(os.Stderr, "sending step %d, length %d\n", a.stepCount, sendToken.Length())
+		return sendToken.Bytes(), nil
+	}
+
+	// XXX: how do we actually check that MajorStatus is GSS_S_COMPLETE ?
+
 	return nil, nil
+}
+
+func decodeGSSAPIContextFlags(w io.Writer, flags uint32) {
+	fmt.Fprintf(w, "GSSAPI Context flags (%d):", flags)
+	if flags == uint32(0) {
+		fmt.Fprintf(w, " <none>\n")
+		return
+	}
+	if flags&gssapi.GSS_C_DELEG_FLAG != 0 {
+		fmt.Fprintf(w, " <delegated-available>")
+	}
+	if flags&gssapi.GSS_C_MUTUAL_FLAG != 0 {
+		fmt.Fprintf(w, " <mutual-requested>")
+	}
+	if flags&gssapi.GSS_C_REPLAY_FLAG != 0 {
+		fmt.Fprintf(w, " <replay-detection-active>")
+	}
+	if flags&gssapi.GSS_C_SEQUENCE_FLAG != 0 {
+		fmt.Fprintf(w, " <out-of-sequence-detection-active>")
+	}
+	if flags&gssapi.GSS_C_CONF_FLAG != 0 {
+		fmt.Fprintf(w, " <confidentiality-available>")
+	}
+	if flags&gssapi.GSS_C_INTEG_FLAG != 0 {
+		fmt.Fprintf(w, " <integrity-protection-available>")
+	}
+	if flags&gssapi.GSS_C_ANON_FLAG != 0 {
+		fmt.Fprintf(w, " <anon-requested>")
+	}
+	if flags&gssapi.GSS_C_PROT_READY_FLAG != 0 {
+		fmt.Fprintf(w, " <protection-during-handshake-available>")
+	}
+	if flags&gssapi.GSS_C_TRANS_FLAG != 0 {
+		fmt.Fprintf(w, " <context-transferable>")
+	}
+	fmt.Fprintf(w, "\n")
 }
 
 var _ imap.SASL = &gssapiAuth{}
@@ -180,7 +364,8 @@ func main() {
 	flag.Parse()
 
 	defersChan := make(chan func())
-	errorsChan := make(chan error)
+	// must buffer errors: we don't check for them until after handling defers
+	errorsChan := make(chan error, 1)
 	go setupIMAP(defersChan, errorsChan)
 	for {
 		d, ok := <-defersChan
@@ -232,7 +417,7 @@ func setupIMAP(defersChan chan<- func(), errorsChan chan<- error) {
 		return
 	}
 	sasl, err := GSSAPIAuth(flags.serverHostname)
-	defersChan <- func() { sasl.(gssapiAuth).Cleanup() }
+	defersChan <- func() { sasl.(*gssapiAuth).Cleanup() }
 	if err != nil {
 		errorsChan <- err
 		return
