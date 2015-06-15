@@ -1,6 +1,7 @@
 package main
 
 import (
+	// stdlib first
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -12,6 +13,10 @@ import (
 	"sync"
 	"time"
 
+	// register extra algorithms for TLS usage
+	_ "crypto/sha512"
+
+	// third-party non-stdlib imports
 	"code.google.com/p/go-imap/go1/imap"
 	"github.com/apcera/gssapi"
 )
