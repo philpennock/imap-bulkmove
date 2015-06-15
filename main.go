@@ -68,6 +68,7 @@ type gssapiAuth struct {
 	requestMech      *gssapi.OID
 	maxMessageLen    uint
 	stepCount        int
+	continueNeeded   bool
 }
 
 // GSSAPIAuth is like the SASL constructions which the IMAP package uses, but
@@ -165,8 +166,6 @@ func (a *gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err erro
 		a.requestMech = a.lib.GSS_C_NO_OID
 	}
 
-	a.stepCount += 1
-
 	// comments here mostly come from Heimdal man-page (more so for input params)
 
 	// ctxOut *CtxId, actualMechType *OID, outputToken *Buffer, retFlags uint32, timeRec time.Duration, err error) {
@@ -214,9 +213,23 @@ func (a *gssapiAuth) Start(s *imap.ServerInfo) (mech string, ir []byte, err erro
 			receiveToken)
 
 	if err != nil {
-		return "", []byte{}, err
+		if err == gssapi.ErrContinueNeeded {
+			a.continueNeeded = true
+			fmt.Fprintf(os.Stderr, "saw Continue Needed: %v\n", a.lib.LastStatus)
+		} else {
+			return "", []byte{}, err
+		}
+	} else {
+		// Go layer returns ErrContinueNeeded if more steps required, so we should
+		// explicitly clear if not set
+		fmt.Fprintf(os.Stderr, "gssapi: step Start returned w/o Continue Needed, one-shot???\n")
+		a.continueNeeded = false
 	}
-	fmt.Fprintf(os.Stderr, "selected mechanism: %s\n", mechUsed.DebugString())
+	if mechUsed != nil {
+		fmt.Fprintf(os.Stderr, "selected mechanism: %s\n", mechUsed.DebugString())
+	} else {
+		fmt.Fprintf(os.Stderr, "WARNING: NIL VALUE SEEN FOR mechUsed FROM InitSecContext\n")
+	}
 	decodeGSSAPIContextFlags(os.Stdout, retFlags)
 
 	//initialResponse := make([]byte, base64.StdEncoding.EncodedLen(sendToken.Length()))
@@ -242,7 +255,7 @@ func (a *gssapiAuth) Next(challenge []byte) (response []byte, err error) {
 	// bindings don't expose a way to get that?  So rely upon knowledge of
 	// Kerberos flow to stop after the GSS bits are complete and extract the
 	// SASL data instead.
-	if a.stepCount > 2 {
+	if !a.continueNeeded {
 		// SASL data, not GSS input
 
 		// decoded (unwrapped) buffer, confState, QOPState, err
@@ -317,8 +330,19 @@ func (a *gssapiAuth) Next(challenge []byte) (response []byte, err error) {
 			0,
 			a.lib.GSS_C_NO_CHANNEL_BINDINGS,
 			receiveToken)
+
 	if err != nil {
-		return nil, err
+		if err == gssapi.ErrContinueNeeded {
+			a.continueNeeded = true
+			fmt.Fprintf(os.Stderr, "saw Continue Needed: %s\n", a.lib.LastStatus)
+		} else {
+			return nil, err
+		}
+	} else {
+		// Go layer returns ErrContinueNeeded if more steps required, so we should
+		// explicitly clear if not set
+		fmt.Fprintf(os.Stderr, "gssapi: step Next returned w/o Continue Needed, we're done\n")
+		a.continueNeeded = false
 	}
 	decodeGSSAPIContextFlags(os.Stdout, retFlags)
 
