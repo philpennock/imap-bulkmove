@@ -459,7 +459,7 @@ func setupIMAP(defersChan chan<- func(), errorsChan chan<- error) {
 	ReportOK(c.Auth(sasl))
 
 	if c.Caps["ID"] {
-		ReportOK(c.ID("name", "imap-datesubdir-move"))
+		ReportOK(c.ID("name", "imap-bulkmove"))
 	}
 	errorsChan <- nil
 }
