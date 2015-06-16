@@ -75,3 +75,20 @@ $ go build
 ```
 
 (amend exact gcc binary filename as appropriate for your system)
+
+Note: if you're not changing the `gssapi` library, then you can avoid needing
+to do this for each build of `imap-bulkmove` and speed compilation too, by
+"installing" that library.  That builds a static library which will be picked
+up when building anything which depends upon the package.
+
+```console
+$ cd ${GOPATH%%:*}/src/github.com/apcera/gssapi
+$ CC=gcc48 go install
+$ cd ${GOPATH%%:*}/src/github.com/philpennock/imap-bulkmove
+$ go build
+```
+
+The static library can be found under `${GOPATH%%:*}/pkg/` (top-level is
+architecture, then the rest matches the import path).  If you `go install` for
+`imap-bulkmove` then you can find the result in `${GOPATH%%:*}/bin` (or a
+sub-directory if cross-compiling).
